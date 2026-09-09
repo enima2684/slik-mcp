@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Serveur MCP Slack, lecture plus brouillons, bibliotheque standard uniquement.
+"""Slack MCP server, read plus drafts, standard library only.
 
-Authentification par jetons de session du client web (xoxc + cookie d), donc
-sans installation d'app dans le workspace. La surface d'appel est bornee par
-ALLOWED_METHODS et ALLOWED_WRITE_METHODS: la seule ecriture possible est
-drafts.create, qui depose un brouillon non envoye dans le client Slack.
+Authenticates with web client session tokens (xoxc + d cookie), so no app has
+to be installed in the workspace. The call surface is bounded by
+ALLOWED_METHODS and ALLOWED_WRITE_METHODS: the only write available is
+drafts.create, which saves an unsent draft in the Slack client.
 
 Usage:
-    server.py            transport stdio MCP (lance par le client)
-    server.py --check    verifie les jetons et sort
+    server.py            MCP stdio transport (started by the client)
+    server.py --check    verify the tokens and exit
 """
 
 import json
@@ -28,7 +28,7 @@ CACHE_TTL = 6 * 3600
 CHANNELS_CACHE = os.path.expanduser(
     os.environ.get("SLACK_MCP_CHANNELS_CACHE", "~/.cache/slack-mcp/channels.json"))
 
-# Le seul garde-fou ecriture: un appel hors de cette liste leve avant le reseau.
+# The only write guard: a call outside these lists raises before any network.
 ALLOWED_METHODS = frozenset({
     "auth.test",
     "conversations.list",
@@ -41,8 +41,8 @@ ALLOWED_METHODS = frozenset({
     "chat.getPermalink",
 })
 
-# Seule ecriture de tout le serveur. drafts.create depose un brouillon dans le
-# client Slack et ne le publie pas: il n'existe aucun chemin d'envoi ici.
+# The one write in the whole server. drafts.create saves a draft in the Slack
+# client and does not publish it: no send path exists here.
 ALLOWED_WRITE_METHODS = frozenset({"drafts.create"})
 
 DEFAULT_UA = (
@@ -85,11 +85,11 @@ def multipart_body(fields):
 
 def api(method, params=None, multipart=False):
     if method not in ALLOWED_METHODS and method not in ALLOWED_WRITE_METHODS:
-        raise SlackError("methode non autorisee: " + method)
+        raise SlackError("method not allowed: " + method)
     token = os.environ.get("SLACK_MCP_XOXC_TOKEN", "").strip()
     cookie = os.environ.get("SLACK_MCP_XOXD_TOKEN", "").strip()
     if not token or not cookie:
-        raise SlackError("SLACK_MCP_XOXC_TOKEN ou SLACK_MCP_XOXD_TOKEN manquant")
+        raise SlackError("SLACK_MCP_XOXC_TOKEN or SLACK_MCP_XOXD_TOKEN missing")
 
     fields = {k: v for k, v in (params or {}).items() if v not in (None, "")}
     if multipart:
@@ -102,8 +102,8 @@ def api(method, params=None, multipart=False):
     for attempt in range(3):
         req = urllib.request.Request(SLACK_API + method, data=body)
         req.add_header("Authorization", "Bearer " + token)
-        # Un jeton xoxc n'est valide qu'accompagne du cookie de session. On
-        # decode puis re-encode pour accepter un xoxd colle brut ou deja encode.
+        # An xoxc token is only valid alongside the session cookie. Decode then
+        # re-encode so a raw or already encoded xoxd both work.
         req.add_header("Cookie", "d=" + urllib.parse.quote(urllib.parse.unquote(cookie), safe=""))
         req.add_header("Content-Type", content_type)
         req.add_header("User-Agent", os.environ.get("SLACK_MCP_USER_AGENT") or DEFAULT_UA)
@@ -114,20 +114,20 @@ def api(method, params=None, multipart=False):
             if exc.code == 429 and attempt < 2:
                 time.sleep(max(1, int(exc.headers.get("Retry-After", "2") or 2)))
                 continue
-            raise SlackError("HTTP %s sur %s" % (exc.code, method))
+            raise SlackError("HTTP %s on %s" % (exc.code, method))
         except urllib.error.URLError as exc:
-            raise SlackError("reseau injoignable: %s" % exc.reason)
+            raise SlackError("network unreachable: %s" % exc.reason)
 
         if payload.get("ok"):
             return payload
-        err = payload.get("error", "erreur inconnue")
+        err = payload.get("error", "unknown error")
         if err == "ratelimited" and attempt < 2:
             time.sleep(2)
             continue
         if err in ("invalid_auth", "not_authed", "token_revoked"):
-            raise SlackError("jetons invalides ou expires (%s): reprendre xoxc et xoxd" % err)
+            raise SlackError("invalid or expired tokens (%s): grab xoxc and xoxd again" % err)
         raise SlackError("%s: %s" % (method, err))
-    raise SlackError("%s: abandon apres 3 tentatives" % method)
+    raise SlackError("%s: gave up after 3 attempts" % method)
 
 
 def paginate(method, params, key, max_pages=10):
@@ -177,9 +177,8 @@ def channel_index(refresh=False):
     if not refresh and _channels["ts"] > time.time() - CACHE_TTL:
         return _channels
 
-    # Reconstruire l'index coute une vingtaine d'appels: sans cache sur disque
-    # chaque demarrage du serveur les repaie, ce qui rend une boucle de
-    # surveillance inutilisable.
+    # Rebuilding the index costs about twenty calls: without an on-disk cache
+    # every server start pays them again, which makes a polling loop unusable.
     if not refresh:
         cached = load_json(CHANNELS_CACHE)
         if cached and cached.get("ts", 0) > time.time() - CACHE_TTL:
@@ -194,8 +193,8 @@ def channel_index(refresh=False):
     )
     _channels["by_id"] = {c["id"]: c for c in rows}
     by_name = {c["name"]: c["id"] for c in rows if c.get("name")}
-    # Les DM n'ont pas de nom: on les indexe sous "@" + nom du correspondant,
-    # sinon la forme "@personne" annoncee par le schema ne resout jamais.
+    # DMs carry no name: index them under "@" + the other person's name, or the
+    # "@person" form the schema advertises never resolves.
     for c in rows:
         if c.get("is_im") and c.get("user"):
             by_name["@" + user_name(c["user"])] = c["id"]
@@ -204,14 +203,14 @@ def channel_index(refresh=False):
     try:
         dump_json(CHANNELS_CACHE, dict(_channels))
     except OSError:
-        pass  # un cache non ecrit degrade la latence, pas le resultat
+        pass  # an unwritten cache costs latency, not correctness
     return _channels
 
 
 def resolve_channel(ref):
     ref = (ref or "").strip()
     if not ref:
-        raise SlackError("channel manquant")
+        raise SlackError("channel missing")
     if re.fullmatch(r"[CDG][A-Z0-9]+", ref):
         return ref
     idx = channel_index()
@@ -221,11 +220,11 @@ def resolve_channel(ref):
     idx = channel_index(refresh=True)
     if name in idx["by_name"]:
         return idx["by_name"][name]
-    raise SlackError("canal introuvable: " + ref)
+    raise SlackError("channel not found: " + ref)
 
 
-# Slack encode les mentions en <@U123> ou <@U123|alias>; sans resolution le
-# texte remonte un identifiant que personne ne peut lire.
+# Slack encodes mentions as <@U123> or <@U123|alias>; unresolved, the text
+# carries an id nobody can read.
 MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
 
 
@@ -237,10 +236,10 @@ USER_ID_RE = re.compile(r"[UW][A-Z0-9]+$")
 
 
 def channel_label(chan):
-    """Nom lisible d'un canal renvoye par la recherche.
+    """Readable name for a conversation returned by search.
 
-    En conversation directe, Slack met l'identifiant du correspondant dans le
-    champ nom, ce qui remonte un Uxxxx illisible si on le prend tel quel.
+    For a DM, Slack puts the other person's id in the name field, which surfaces
+    an unreadable Uxxxx if taken as is.
     """
     if not isinstance(chan, dict):
         return ""
@@ -390,17 +389,17 @@ def tool_watch(args):
     state = read_watch_state()
     since = args.get("since") or state.get(channel)
 
-    # Premier appel sans repere: on pose la borne au present et on ne remonte
-    # rien, sinon la surveillance rejouerait tout l'historique du canal.
+    # First call with no marker: set it to now and return nothing, otherwise the
+    # watch would replay the whole channel history.
     if not since:
         state[channel] = "%.6f" % time.time()
         write_watch_state(state)
         return {"channel": channel, "new": 0, "messages": [],
-                "cursor": state[channel], "note": "repere pose, rien remonte au premier appel"}
+                "cursor": state[channel], "note": "marker set, nothing returned on the first call"}
 
     payload = api("conversations.history", {"channel": channel, "oldest": since, "limit": 200})
-    # oldest est inclusif chez Slack: sans ce filtre le dernier message vu
-    # ressortirait a chaque tour.
+    # Slack treats oldest as inclusive: without this filter the last seen
+    # message would come back on every tick.
     fresh = [m for m in payload.get("messages", []) if m.get("ts") != since]
 
     if fresh and not args.get("peek"):
@@ -419,7 +418,7 @@ def tool_draft(args):
     channel = resolve_channel(args.get("channel"))
     text = args.get("text") or ""
     if not text.strip():
-        raise SlackError("texte vide")
+        raise SlackError("empty text")
 
     destination = {"channel_id": channel}
     if args.get("thread_ts"):
@@ -434,24 +433,24 @@ def tool_draft(args):
         "file_ids": "[]",
         "is_from_composer": "false",
     }
-    # Endpoint interne, encodage non documente: le client web poste en
-    # multipart, d'autres implementations en form-urlencode. On tente le
-    # second, moins couteux, et on repasse en multipart si Slack le refuse.
+    # Internal endpoint, undocumented encoding: the web client posts multipart,
+    # other implementations form-urlencode. Try the cheaper one first and fall
+    # back to multipart if Slack rejects it.
     try:
         payload = api("drafts.create", fields)
     except SlackError as exc:
         message = str(exc).lower()
-        # Slack n'accepte qu'un brouillon par conversation, et le refus est mal
-        # nomme: sans cette traduction l'agent croit a un probleme d'auth.
+        # Slack allows one draft per conversation, and names the refusal badly:
+        # untranslated, the agent reads it as an auth problem.
         if "attached_draft_exists" in message:
-            raise SlackError("un brouillon existe deja dans cette conversation: "
-                             "le vider ou l'envoyer dans Slack avant d'en creer un autre")
+            raise SlackError("a draft already exists in this conversation: clear or "
+                             "send it in Slack before creating another")
         if "invalid" not in message:
             raise
         payload = api("drafts.create", fields, multipart=True)
 
-    # La cle portant l'identifiant n'est pas documentee et a change par le
-    # passe: on remonte ce que la reponse contient plutot que de la deviner.
+    # The key holding the identifier is undocumented and has changed before:
+    # return what the response carries rather than guessing its name.
     ids = {k: v for k, v in payload.items() if "id" in k.lower() and isinstance(v, (str, int))}
     draft = payload.get("draft")
     if isinstance(draft, dict):
@@ -459,33 +458,33 @@ def tool_draft(args):
     return {
         "ids": ids,
         "channel": channel,
-        "note": "Brouillon depose dans Slack (section Brouillons). Non envoye.",
+        "note": "Draft saved in Slack (Drafts section). Not sent.",
     }
 
 
 TOOLS = [
     {
         "name": "slack_channels",
-        "description": "Liste ou filtre les canaux du workspace (id, nom, type, nombre de membres).",
+        "description": "List or filter workspace conversations (id, name, type, member count).",
         "inputSchema": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "Filtre sur le nom, sous-chaine."},
+            "query": {"type": "string", "description": "Substring filter on the name."},
             "types": {"type": "string", "description": "public_channel,private_channel,mpim,im"},
             "limit": {"type": "integer"}, "refresh": {"type": "boolean"}}},
         "handler": tool_channels,
     },
     {
         "name": "slack_history",
-        "description": "Messages d'un canal, par id Cxxxx ou par #nom. Pagination par cursor.",
+        "description": "Messages from a conversation, by Cxxxx id or #name. Paginated with cursor.",
         "inputSchema": {"type": "object", "properties": {
             "channel": {"type": "string"}, "limit": {"type": "integer"},
-            "oldest": {"type": "string", "description": "Timestamp Slack de debut."},
+            "oldest": {"type": "string", "description": "Slack timestamp to start from."},
             "latest": {"type": "string"}, "cursor": {"type": "string"}},
             "required": ["channel"]},
         "handler": tool_history,
     },
     {
         "name": "slack_thread",
-        "description": "Fil complet a partir du ts du message parent.",
+        "description": "Full thread, from the parent message ts.",
         "inputSchema": {"type": "object", "properties": {
             "channel": {"type": "string"}, "thread_ts": {"type": "string"},
             "limit": {"type": "integer"}, "cursor": {"type": "string"}},
@@ -494,7 +493,7 @@ TOOLS = [
     },
     {
         "name": "slack_search",
-        "description": "Recherche de messages. Accepte la syntaxe Slack (in:#canal, from:@user, after:2026-01-01).",
+        "description": "Message search. Accepts Slack syntax (in:#channel, from:@user, after:2026-01-01).",
         "inputSchema": {"type": "object", "properties": {
             "query": {"type": "string"}, "count": {"type": "integer"},
             "page": {"type": "integer"}, "sort": {"type": "string"}},
@@ -503,14 +502,14 @@ TOOLS = [
     },
     {
         "name": "slack_users",
-        "description": "Cherche un membre par nom, identifiant ou email.",
+        "description": "Find a member by name, username or email.",
         "inputSchema": {"type": "object", "properties": {
             "query": {"type": "string"}, "limit": {"type": "integer"}}},
         "handler": tool_users,
     },
     {
         "name": "slack_permalink",
-        "description": "Lien permanent d'un message, pour le citer ailleurs.",
+        "description": "Permalink to a message, to cite it elsewhere.",
         "inputSchema": {"type": "object", "properties": {
             "channel": {"type": "string"}, "ts": {"type": "string"}},
             "required": ["channel", "ts"]},
@@ -518,25 +517,25 @@ TOOLS = [
     },
     {
         "name": "slack_draft",
-        "description": ("Depose un brouillon non envoye dans le client Slack, visible dans la section "
-                        "Brouillons. N'envoie jamais: la relecture et l'envoi restent manuels. Le texte "
-                        "est insere tel quel, sans interpretation du markdown Slack."),
+        "description": ("Save an unsent draft in the Slack client, visible under Drafts. Never sends: "
+                        "review and sending stay manual. The text is inserted as is, Slack markdown "
+                        "is not interpreted."),
         "inputSchema": {"type": "object", "properties": {
-            "channel": {"type": "string", "description": "Id Cxxxx, #canal ou @personne."},
-            "text": {"type": "string", "description": "Corps du message, sauts de ligne conserves."},
-            "thread_ts": {"type": "string", "description": "Pour brouillonner une reponse dans un fil."}},
+            "channel": {"type": "string", "description": "Cxxxx id, #channel or @person."},
+            "text": {"type": "string", "description": "Message body, newlines preserved."},
+            "thread_ts": {"type": "string", "description": "To draft a reply inside a thread."}},
             "required": ["channel", "text"]},
         "handler": tool_draft,
     },
     {
         "name": "slack_watch",
-        "description": ("Messages arrives dans un canal depuis le dernier appel, et avance le repere. "
-                        "Le premier appel pose le repere et ne remonte rien. A appeler en boucle par "
-                        "un pilote: le serveur ne signale rien de lui-meme."),
+        "description": ("Messages posted in a conversation since the last call, and advances the marker. "
+                        "The first call sets the marker and returns nothing. Must be polled by a "
+                        "driver: the server never notifies on its own."),
         "inputSchema": {"type": "object", "properties": {
-            "channel": {"type": "string", "description": "Id Cxxxx, #canal ou @personne."},
-            "since": {"type": "string", "description": "Forcer le point de depart, timestamp Slack."},
-            "peek": {"type": "boolean", "description": "Lire sans avancer le repere."}},
+            "channel": {"type": "string", "description": "Cxxxx id, #channel or @person."},
+            "since": {"type": "string", "description": "Force the starting point, Slack timestamp."},
+            "peek": {"type": "boolean", "description": "Read without advancing the marker."}},
             "required": ["channel"]},
         "handler": tool_watch,
     },
@@ -560,7 +559,7 @@ def handle(msg):
     method = msg.get("method")
     msg_id = msg.get("id")
     if msg_id is None:
-        return  # notification: rien a renvoyer
+        return  # notification: nothing to answer
 
     if method == "initialize":
         asked = (msg.get("params") or {}).get("protocolVersion")
@@ -577,7 +576,7 @@ def handle(msg):
         params = msg.get("params") or {}
         name = params.get("name")
         if name not in HANDLERS:
-            respond(msg_id, error={"code": -32602, "message": "outil inconnu: %s" % name})
+            respond(msg_id, error={"code": -32602, "message": "unknown tool: %s" % name})
             return
         try:
             result = HANDLERS[name](params.get("arguments") or {})
@@ -585,11 +584,11 @@ def handle(msg):
             respond(msg_id, {"content": [{"type": "text", "text": payload}], "isError": False})
         except SlackError as exc:
             respond(msg_id, {"content": [{"type": "text", "text": str(exc)}], "isError": True})
-        except Exception as exc:  # remonte l'erreur a l'agent plutot que tuer le serveur
+        except Exception as exc:  # surface the error to the agent rather than kill the server
             respond(msg_id, {"content": [{"type": "text", "text": "%s: %s" % (type(exc).__name__, exc)}],
                              "isError": True})
     else:
-        respond(msg_id, error={"code": -32601, "message": "methode non supportee: %s" % method})
+        respond(msg_id, error={"code": -32601, "message": "method not supported: %s" % method})
 
 
 def main():
@@ -597,10 +596,10 @@ def main():
     if "--check" in sys.argv:
         try:
             who = api("auth.test")
-            log("ok: %s sur %s (%s)" % (who.get("user"), who.get("team"), who.get("url")))
+            log("ok: %s on %s (%s)" % (who.get("user"), who.get("team"), who.get("url")))
             return 0
         except SlackError as exc:
-            log("echec: %s" % exc)
+            log("failed: %s" % exc)
             return 1
     for line in sys.stdin:
         line = line.strip()
