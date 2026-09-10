@@ -11,6 +11,7 @@ Usage:
     server.py --check    verify the tokens and exit
 """
 
+import base64
 import json
 import os
 import re
@@ -25,6 +26,10 @@ from datetime import datetime
 SLACK_API = "https://slack.com/api/"
 TIMEOUT = 30
 CACHE_TTL = 6 * 3600
+# Base64 inflates by a third, and the model API refuses an image past 5 MB
+# encoded; over this the fetch steps down to a thumbnail.
+MAX_IMAGE_BYTES = 3_500_000
+MAX_TEXT_BYTES = 200_000
 CHANNELS_CACHE = os.path.expanduser(
     os.environ.get("SLACK_MCP_CHANNELS_CACHE", "~/.cache/slack-mcp/channels.json"))
 
@@ -35,6 +40,7 @@ ALLOWED_METHODS = frozenset({
     "conversations.history",
     "conversations.replies",
     "conversations.info",
+    "files.info",
     "search.messages",
     "users.info",
     "users.list",
@@ -256,6 +262,20 @@ def iso(ts):
         return ""
 
 
+# Ordered fallbacks when the original is too large to inline.
+THUMB_KEYS = ("thumb_1024", "thumb_960", "thumb_800", "thumb_720", "thumb_480", "thumb_360")
+
+
+def shape_file(f):
+    row = {"id": f.get("id"), "name": f.get("name") or f.get("title"),
+           "mimetype": f.get("mimetype"), "size": f.get("size")}
+    if f.get("original_w"):
+        row["dimensions"] = "%sx%s" % (f.get("original_w"), f.get("original_h"))
+    if f.get("permalink"):
+        row["permalink"] = f["permalink"]
+    return row
+
+
 def shape(msg):
     row = {
         "ts": msg.get("ts"),
@@ -263,6 +283,11 @@ def shape(msg):
         "user": user_name(msg.get("user") or msg.get("bot_id", "")),
         "text": resolve_mentions(msg.get("text", "")),
     }
+    # A message can be nothing but an image: without this the row reads as
+    # empty and the attachment is invisible to the caller.
+    files = [shape_file(f) for f in (msg.get("files") or []) if isinstance(f, dict)]
+    if files:
+        row["files"] = files
     if msg.get("thread_ts") and msg.get("thread_ts") != msg.get("ts"):
         row["thread_ts"] = msg["thread_ts"]
     if msg.get("reply_count"):
@@ -357,6 +382,81 @@ def tool_users(args):
         if len(rows) >= int(args.get("limit") or 20):
             break
     return rows
+
+
+SLACK_HOST_RE = re.compile(r"^([a-z0-9-]+\.)*slack(-files)?\.com$", re.I)
+
+
+def fetch_url(url):
+    """GET a Slack-hosted file with the session credentials.
+
+    url_private sits on files.slack.com, outside the api() surface, but needs
+    the same bearer token and d cookie.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not SLACK_HOST_RE.match(parsed.hostname or ""):
+        raise SlackError("refusing to fetch a non-Slack url: " + url)
+    token = os.environ.get("SLACK_MCP_XOXC_TOKEN", "").strip()
+    cookie = os.environ.get("SLACK_MCP_XOXD_TOKEN", "").strip()
+    if not token or not cookie:
+        raise SlackError("SLACK_MCP_XOXC_TOKEN or SLACK_MCP_XOXD_TOKEN missing")
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Cookie", "d=" + urllib.parse.quote(urllib.parse.unquote(cookie), safe=""))
+    req.add_header("User-Agent", os.environ.get("SLACK_MCP_USER_AGENT") or DEFAULT_UA)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return resp.read(), (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+    except urllib.error.HTTPError as exc:
+        raise SlackError("HTTP %s fetching the file" % exc.code)
+    except urllib.error.URLError as exc:
+        raise SlackError("network unreachable: %s" % exc.reason)
+
+
+FILE_ID_RE = re.compile(r"\b(F[A-Z0-9]{6,})\b")
+
+
+def tool_file(args):
+    ref = (args.get("file") or "").strip()
+    if not ref:
+        raise SlackError("file missing: pass a Fxxxx id or a files.slack.com url")
+
+    match = FILE_ID_RE.search(ref)
+    if not match:
+        raise SlackError("no file id in: " + ref)
+    info = api("files.info", {"file": match.group(1)})["file"]
+
+    mimetype = info.get("mimetype") or ""
+    name = info.get("name") or info.get("title") or match.group(1)
+
+    if not mimetype.startswith("image/"):
+        # A snippet or a posted text file is still readable; anything else is
+        # not something the caller can do anything with inline.
+        if mimetype.startswith("text/") or mimetype in ("application/json", "application/xml"):
+            data, _ = fetch_url(info.get("url_private"))
+            body = data[:MAX_TEXT_BYTES].decode("utf-8", "replace")
+            if len(data) > MAX_TEXT_BYTES:
+                body += "\n[truncated at %d bytes of %d]" % (MAX_TEXT_BYTES, len(data))
+            return {"_content": [{"type": "text", "text": body}]}
+        raise SlackError("%s is a %s, not an image or text file: open %s"
+                         % (name, mimetype or "unknown type", info.get("permalink") or ""))
+
+    candidates = [info.get("url_private")] + [info.get(k) for k in THUMB_KEYS]
+    tried = []
+    for url in [u for u in candidates if u]:
+        data, content_type = fetch_url(url)
+        if len(data) <= MAX_IMAGE_BYTES:
+            note = "%s (%s, %d bytes)" % (name, content_type or mimetype, len(data))
+            if tried:
+                note += ", downscaled: the original exceeded the inline limit"
+            return {"_content": [
+                {"type": "text", "text": note},
+                {"type": "image", "data": base64.b64encode(data).decode("ascii"),
+                 "mimeType": content_type or mimetype},
+            ]}
+        tried.append(len(data))
+    raise SlackError("%s is too large to inline even downscaled (%s bytes): open %s"
+                     % (name, tried, info.get("permalink") or ""))
 
 
 def tool_permalink(args):
@@ -508,6 +608,16 @@ TOOLS = [
         "handler": tool_users,
     },
     {
+        "name": "slack_file",
+        "description": ("Fetch a file attached to a message and return it inline: an image comes back "
+                        "as an image, a text file as its content. Use it on any files[] entry a "
+                        "message carries, otherwise the attachment stays invisible."),
+        "inputSchema": {"type": "object", "properties": {
+            "file": {"type": "string", "description": "Fxxxx id, or a Slack file permalink."}},
+            "required": ["file"]},
+        "handler": tool_file,
+    },
+    {
         "name": "slack_permalink",
         "description": "Permalink to a message, to cite it elsewhere.",
         "inputSchema": {"type": "object", "properties": {
@@ -580,8 +690,13 @@ def handle(msg):
             return
         try:
             result = HANDLERS[name](params.get("arguments") or {})
-            payload = json.dumps(result, ensure_ascii=False, indent=1)
-            respond(msg_id, {"content": [{"type": "text", "text": payload}], "isError": False})
+            # A handler returning binary (an image) builds its own blocks; every
+            # other one is serialised as text.
+            if isinstance(result, dict) and "_content" in result:
+                content = result["_content"]
+            else:
+                content = [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=1)}]
+            respond(msg_id, {"content": content, "isError": False})
         except SlackError as exc:
             respond(msg_id, {"content": [{"type": "text", "text": str(exc)}], "isError": True})
         except Exception as exc:  # surface the error to the agent rather than kill the server
